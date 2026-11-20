@@ -12,10 +12,12 @@ import 'package:hive_ce/src/binary/binary_writer_impl.dart';
 import 'package:hive_ce/src/binary/frame.dart';
 import 'package:hive_ce/src/box/change_notifier.dart';
 import 'package:hive_ce/src/box/keystore.dart';
+import 'package:hive_ce/src/hive_impl.dart';
 import 'package:hive_ce/src/registry/type_registry_impl.dart';
 import 'package:test/test.dart';
 import 'package:web/web.dart';
 
+import '../../common.dart';
 import '../../frames.dart';
 
 late final IDBDatabase _nullDatabase;
@@ -48,6 +50,53 @@ Future<IDBDatabase> _getDbWith(Map<String, Object?> content) async {
   await store.clear().asFuture();
   content.forEach((k, v) => store.put(v.jsify(), k.toJS));
   return db;
+}
+
+Future<IDBDatabase> _openDbWithUniqueValues(String name) async {
+  final request = window.self.indexedDB.open(name, 1);
+  request.onupgradeneeded = (IDBVersionChangeEvent e) {
+    final db = (e.target as IDBOpenDBRequest).result as IDBDatabase;
+    db.createObjectStore('box').createIndex(
+          'value',
+          ''.toJS,
+          IDBIndexParameters(unique: true),
+        );
+  }.toJS;
+  return await request.asFuture<IDBDatabase>();
+}
+
+String _uniqueDbName(String prefix) =>
+    '$prefix-${DateTime.timestamp().microsecondsSinceEpoch}';
+
+Future<Map<Object, Object?>> _readAll(StorageBackendJs backend) async {
+  return Map.fromIterables(await backend.getKeys(), await backend.getValues());
+}
+
+class _Unregistered {}
+
+class _CountingBackend extends StorageBackendJs {
+  var encodedFrames = 0;
+
+  _CountingBackend(IDBDatabase db) : super(db, null, 'box');
+
+  @override
+  JSAny? encodeValue(Frame frame) {
+    encodedFrames++;
+    return super.encodeValue(frame);
+  }
+}
+
+class _CapturingBackend extends StorageBackendJs {
+  late IDBObjectStore writeStore;
+
+  _CapturingBackend(IDBDatabase db) : super(db, null, 'box');
+
+  @override
+  IDBObjectStore getStore(bool write) {
+    final store = super.getStore(write);
+    if (write) writeStore = store;
+    return store;
+  }
 }
 
 void main() async {
@@ -265,6 +314,127 @@ void main() async {
 
       await backend.writeFrames([Frame.deleted('key1')]);
       expect(await backend.getKeys(), ['key2']);
+    });
+
+    group('.writeFrames() batch', () {
+      test('writes every frame of a large batch', () async {
+        final name = _uniqueDbName('largebatch');
+        final db = await _openDb(name);
+        final frames = [for (var i = 0; i < 500; i++) Frame('key$i', i)];
+        await _getBackend(db: db).writeFrames(frames);
+        db.close();
+
+        final reopened = await _openDb(name);
+        expect(await _readAll(_getBackend(db: reopened)), {
+          for (var i = 0; i < 500; i++) 'key$i': i,
+        });
+        reopened.close();
+      });
+
+      test('keeps the last write of a key repeated in one batch', () async {
+        final db = await _getDbWith({});
+        final backend = _getBackend(db: db);
+        await backend.writeFrames([
+          Frame('overwritten', 1),
+          Frame('overwritten', 2),
+          Frame('deletedAfterPut', 1),
+          Frame.deleted('deletedAfterPut'),
+          Frame.deleted('putAfterDelete'),
+          Frame('putAfterDelete', 3),
+        ]);
+
+        expect(
+          await _readAll(backend),
+          {'overwritten': 2, 'putAfterDelete': 3},
+        );
+      });
+
+      test('issues every request before waiting', () async {
+        final db = await _getDbWith({});
+        final backend = _CountingBackend(db);
+        final frames = [for (var i = 0; i < 500; i++) Frame('key$i', i)];
+
+        final write = backend.writeFrames(frames);
+        expect(backend.encodedFrames, 500);
+        await write;
+      });
+
+      test('writes nothing when a frame fails to encode', () async {
+        final db = await _getDbWith({'kept': 0});
+        final backend = _getBackend(db: db, registry: TypeRegistryImpl());
+
+        await expectLater(
+          backend.writeFrames([
+            Frame('kept', 1),
+            Frame('added', 2),
+            Frame('failing', _Unregistered()),
+          ]),
+          throwsA(isA<HiveError>()),
+        );
+        expect(await _readAll(backend), {'kept': 0});
+      });
+
+      test('writes nothing when a request fails', () async {
+        final db = await _openDbWithUniqueValues(_uniqueDbName('unique'));
+        final backend = _getBackend(db: db);
+
+        await expectLater(
+          backend
+              .writeFrames([Frame('first', 'same'), Frame('second', 'same')]),
+          throwsA(
+            predicate((e) => (e as DOMException).name == 'ConstraintError'),
+          ),
+        );
+        expect(await backend.getKeys(), isEmpty);
+        db.close();
+      });
+
+      test('writes nothing when the transaction aborts', () async {
+        final db = await _getDbWith({});
+        final backend = _CapturingBackend(db);
+
+        final write = backend.writeFrames([Frame('key1', 1), Frame('key2', 2)]);
+        backend.writeStore.transaction.abort();
+
+        await expectLater(write, throwsA(anything));
+        expect(await backend.getKeys(), isEmpty);
+      });
+
+      test('box rolls back a batch that fails to encode', () async {
+        final hive = HiveImpl();
+        addTearDown(hive.close);
+        hive.init(null);
+        final name = generateBoxName();
+        var box = await hive.openBox(name);
+        await box.put('kept', 0);
+
+        await expectLater(
+          box.putAll({'kept': 1, 'added': 2, 'failing': _Unregistered()}),
+          throwsA(isA<HiveError>()),
+        );
+        expect(box.toMap(), {'kept': 0});
+
+        await box.close();
+        box = await hive.openBox(name);
+        expect(box.toMap(), {'kept': 0});
+        await box.deleteFromDisk();
+      });
+
+      test('box reads back a large putAll after reopening', () async {
+        final hive = HiveImpl();
+        addTearDown(hive.close);
+        hive.init(null);
+        final name = generateBoxName();
+        final entries = {for (var i = 0; i < 500; i++) 'key$i': i};
+        var box = await hive.openBox(name);
+
+        await box.putAll(entries);
+        await box.close();
+        box = await hive.openBox(name);
+
+        expect(box.toMap(), entries);
+        await box.deleteFromDisk();
+      });
     });
 
     test('.compact()', () async {

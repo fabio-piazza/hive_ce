@@ -188,13 +188,35 @@ class StorageBackendJs extends StorageBackend {
   @override
   Future<void> writeFrames(List<Frame> frames, {bool verbatim = false}) async {
     final store = getStore(true);
-    for (final frame in frames) {
-      if (frame.deleted) {
-        await store.delete(frame.key.jsify()).asFuture();
-      } else {
-        await store.put(encodeValue(frame), frame.key.jsify()).asFuture();
+    final transaction = store.transaction;
+    final completer = Completer<void>();
+    Object? thrownError;
+    StackTrace? thrownStackTrace;
+    transaction.oncomplete = (Event e) {
+      completer.complete();
+    }.toJS;
+    transaction.onabort = (Event e) {
+      completer.completeError(
+        thrownError ??
+            transaction.error ??
+            StateError('IDBTransaction aborted without an error'),
+        thrownStackTrace,
+      );
+    }.toJS;
+    try {
+      for (final frame in frames) {
+        if (frame.deleted) {
+          store.delete(frame.key.jsify());
+        } else {
+          store.put(encodeValue(frame), frame.key.jsify());
+        }
       }
+    } catch (error, stackTrace) {
+      thrownError = error;
+      thrownStackTrace = stackTrace;
+      transaction.abort();
     }
+    await completer.future;
   }
 
   @override
